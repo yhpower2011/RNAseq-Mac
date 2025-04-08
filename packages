@@ -1,3 +1,5 @@
+# Update Homebrew 
+brew update
 # Install core bioinformatics tools via Homebrew
 brew install fastqc trimmomatic star samtools subread
 
