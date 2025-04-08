@@ -1,0 +1,10 @@
+# Install core bioinformatics tools via Homebrew
+brew install fastqc trimmomatic star samtools subread
+
+# Install R (choose either the Homebrew build or the CRAN binary via cask)
+brew install r              # Homebrew build of R (no GUI), OR:
+# brew install --cask r     # CRAN binary build of R with R.app GUI
+
+# Install Bioconductor packages in R (DESeq2, tximport, rhdf5, clusterProfiler, etc.)
+R -e 'install.packages("BiocManager", repos="https://cloud.r-project.org/")'
+R -e 'BiocManager::install(c("DESeq2","tximport","rhdf5","clusterProfiler","org.Mm.eg.db"))'
