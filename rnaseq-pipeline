@@ -1,0 +1,181 @@
+#!/bin/bash
+set -euo pipefail   # robust error handling&#8203;:contentReference[oaicite:4]{index=4}
+
+# Ensure Homebrew binaries are in PATH (for non-interactive Automator runs)
+export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
+
+# Number of CPU cores available on this Mac (auto-detect):
+CPU_CORES=$(sysctl -n hw.logicalcpu 2>/dev/null || echo 8)
+
+# Define project names
+projects=( "RNAseq-a" "RNAseq-b" "RNAseq-c" )
+
+# Create project directories and subdirectories
+for proj in "${projects[@]}"; do
+    mkdir -p "$proj"/{raw_data,trimmed_data,fastqc_results,alignment,counts,analysis}
+done
+
+echo "=== RNA-seq pipeline started ==="
+echo "Projects created: RNAseq-a, RNAseq-b, RNAseq-c with sub-folders."
+
+# Prepare reference genome and annotation (download if not already present)
+mkdir -p reference
+GENOME_URL="ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M36/GRCm39.primary_assembly.genome.fa.gz"
+GTF_URL="ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M36/gencode.vM36.primary_assembly.annotation.gtf.gz"
+if [ ! -f reference/genome.fa.gz ]; then
+    echo "Downloading GRCm39 genome FASTA..."
+    curl -L -o reference/genome.fa.gz "$GENOME_URL"
+fi
+if [ ! -f reference/annotation.gtf.gz ]; then
+    echo "Downloading GENCODE vM36 annotation GTF..."
+    curl -L -o reference/annotation.gtf.gz "$GTF_URL"
+fi
+# Decompress if not already decompressed
+if [ ! -f reference/genome.fa ]; then 
+    gunzip -c reference/genome.fa.gz > reference/genome.fa
+fi
+if [ ! -f reference/annotation.gtf ]; then 
+    gunzip -c reference/annotation.gtf.gz > reference/annotation.gtf
+fi
+
+# Build STAR index (if not already built) using 149 bp overhang for 150 bp reads
+if [ ! -d reference/STARindex ]; then
+    echo "Building STAR index (sjdbOverhang=149 for 150bp reads)..."
+    mkdir -p reference/STARindex
+    STAR --runThreadN $THREADS --runMode genomeGenerate \
+         --genomeDir reference/STARindex \
+         --genomeFastaFiles reference/genome.fa \
+         --sjdbGTFfile reference/annotation.gtf \
+         --sjdbOverhang 149
+    echo "STAR index built in reference/STARindex."
+fi
+
+# Set path to Trimmomatic adapter file (Homebrew installs adapters here)
+ADAPTER_FILE="$(brew --prefix)/share/trimmomatic/adapters/TruSeq3-PE.fa"
+
+# Loop over each project and process the FASTQ files
+for proj in "${projects[@]}"; do
+    echo ">>> Processing project: $proj"
+    # Only proceed if raw FASTQ files exist in the project
+    if compgen -G "$proj/raw_data/*_R1*.fastq*" > /dev/null; then
+        # 1. Quality Control with FastQC
+        echo "Running FastQC on raw reads in $proj/raw_data/ ..."
+        fastqc -t $THREADS -o "$proj/fastqc_results" "$proj/raw_data"/*fastq*
+        echo "FastQC reports saved to $proj/fastqc_results."
+
+        # 2. Adapter and quality trimming with Trimmomatic
+        for f1 in "$proj/raw_data"/*_R1*.fastq*; do
+            f2="${f1/_R1/_R2}"  # corresponding R2 file
+            sampleName="$(basename "$f1")"
+            sampleName="${sampleName%%_R1*}"  # sample name prefix (before _R1)
+            out1="$proj/trimmed_data/${sampleName}_R1_trimmed_paired.fastq.gz"
+            out1_un="$proj/trimmed_data/${sampleName}_R1_trimmed_unpaired.fastq.gz"
+            out2="$proj/trimmed_data/${sampleName}_R2_trimmed_paired.fastq.gz"
+            out2_un="$proj/trimmed_data/${sampleName}_R2_trimmed_unpaired.fastq.gz"
+            echo "Trimming adapters and low-quality bases for sample $sampleName ..."
+            trimmomatic PE -threads $THREADS -phred33 \
+                "$f1" "$f2" \
+                "$out1" "$out1_un" "$out2" "$out2_un" \
+                ILLUMINACLIP:"$ADAPTER_FILE":2:30:10 SLIDINGWINDOW:4:20 MINLEN:36
+            # Trimmomatic outputs summary to stdout; trimmed reads saved in trimmed_data
+        done
+        echo "Trimming completed for $proj. Trimmed reads are in $proj/trimmed_data."
+
+        # 3. Alignment with STAR for each sample
+        for f1 in "$proj/trimmed_data"/*_R1_trimmed_paired.fastq.gz; do
+            f2="${f1/_R1_trimmed_paired/_R2_trimmed_paired}"  # mate 2
+            sampleBase="$(basename "$f1" "_R1_trimmed_paired.fastq.gz")"
+            echo "Aligning sample $sampleBase with STAR ..."
+            STAR --runThreadN $THREADS --genomeDir reference/STARindex \
+                 --readFilesIn "$f1" "$f2" --readFilesCommand zcat \
+                 --outFileNamePrefix "$proj/alignment/${sampleBase}_" \
+                 --outSAMtype BAM Unsorted
+            # STAR output: ${sampleBase}_Aligned.out.bam in alignment/
+            samtools sort -@ $THREADS -o "$proj/alignment/${sampleBase}_sorted.bam" \
+                          "$proj/alignment/${sampleBase}_Aligned.out.bam"
+            samtools index -@ $THREADS "$proj/alignment/${sampleBase}_sorted.bam"
+            rm "$proj/alignment/${sampleBase}_Aligned.out.bam"  # remove unsorted BAM
+            echo "STAR alignment finished for $sampleBase (sorted BAM: ${sampleBase}_sorted.bam)."
+        done
+
+        # 4. Gene counting with featureCounts
+        echo "Counting reads with featureCounts (using GENCODE annotation)..."
+        featureCounts -T $THREADS -p -t exon -g gene_id -a reference/annotation.gtf \
+                      -o "$proj/counts/gene_counts.txt" "$proj/alignment"/*_sorted.bam
+        echo "Gene counts saved to $proj/counts/gene_counts.txt"
+
+        # 5. Differential expression and GO analysis with R (DESeq2 + clusterProfiler)
+        echo "Running DESeq2 differential expression and GO enrichment analysis for $proj..."
+        pushd "$proj" > /dev/null  # enter project directory for R script
+        Rscript <<'RSCRIPT'
+        # Load required libraries
+        suppressMessages(library(DESeq2))
+        suppressMessages(library(clusterProfiler))
+        suppressMessages(library(org.Mm.eg.db))
+
+        # Read featureCounts output
+        count_data <- read.table("counts/gene_counts.txt", header=TRUE, sep="\t", comment.char="#")
+        # Set rownames as Gene ID and drop unnecessary columns
+        rownames(count_data) <- count_data$Geneid
+        count_data <- count_data[ , !(colnames(count_data) %in% c("Geneid","Chr","Start","End","Strand","Length"))]
+        # Simplify column names (remove file extensions)
+        colnames(count_data) <- sub(".sorted.bam$", "", sub(".bam$", "", colnames(count_data)))
+
+        # Infer conditions from filenames (expects "control" or "treatment" in names)
+        sample_names <- colnames(count_data)
+        conditions <- ifelse(grepl("control", sample_names, ignore.case=TRUE), "control",
+                       ifelse(grepl("treatment", sample_names, ignore.case=TRUE), "treatment", NA))
+        conditions <- factor(conditions)
+        coldata <- data.frame(row.names=sample_names, condition=conditions)
+
+        # Run DESeq2 differential expression
+        dds <- DESeqDataSetFromMatrix(count_data, colData=coldata, design=~condition)
+        dds <- DESeq(dds)
+        res <- results(dds, alpha=0.05)  # results with padj <= 0.05 significance threshold
+        res <- res[order(res$padj), ]    # sort by adjusted p-value
+        res_df <- as.data.frame(res)
+        write.csv(res_df, file="analysis/deseq2_results.csv")
+
+        # PCA plot of samples
+        vsd <- vst(dds)
+        png("analysis/PCA_plot.png", width=800, height=600)
+        print(plotPCA(vsd, intgroup="condition"))
+        dev.off()
+
+        # MA plot (log2 fold change vs mean expression)
+        png("analysis/MA_plot.png", width=800, height=600)
+        plotMA(res, main="DESeq2 MA-Plot", ylim=c(-5,5))
+        dev.off()
+
+        # Volcano plot (highlight significant genes)
+        res_df$minusLog10P <- -log10(res_df$pvalue)
+        res_df$signif <- !is.na(res_df$padj) & res_df$padj < 0.05
+        png("analysis/Volcano_plot.png", width=800, height=600)
+        with(res_df, plot(log2FoldChange, minusLog10P, pch=20,
+                          col=ifelse(signif, "red", "gray"),
+                          xlab="Log2 Fold Change", ylab="-Log10 p-value", main="Volcano Plot"))
+        dev.off()
+
+        # GO enrichment analysis (Biological Process) for significantly DE genes
+        sig_genes <- rownames(res_df)[!is.na(res_df$padj) & res_df$padj < 0.05]
+        if (length(sig_genes) > 0) {
+          ego <- enrichGO(gene=sig_genes, universe=rownames(res_df), OrgDb=org.Mm.eg.db,
+                          keyType="ENSEMBL", ont="BP", pAdjustMethod="BH", qvalueCutoff=0.05)
+          ego_df <- as.data.frame(ego)
+          write.csv(ego_df, file="analysis/GO_enrichment_results.csv")
+          # Plot top 10 GO terms if available
+          if (nrow(ego_df) > 0) {
+            png("analysis/GO_enrichment_top10.png", width=800, height=600)
+            print(dotplot(ego, showCategory=10) + ggplot2::ggtitle("Top 10 GO terms"))
+            dev.off()
+          }
+        }
+        RSCRIPT
+        popd > /dev/null  # return to base directory
+        echo "DESeq2 analysis and GO enrichment done for $proj (results in $proj/analysis/)."
+    else
+        echo "No FASTQ files found in $proj/raw_data/ – skipping $proj."
+    fi
+done
+
+echo "=== Pipeline completed! ==="
