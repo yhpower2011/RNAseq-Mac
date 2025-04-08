@@ -20,8 +20,11 @@ echo "Projects created: RNAseq-a, RNAseq-b, RNAseq-c with sub-folders."
 
 # Prepare reference genome and annotation (download if not already present)
 mkdir -p reference
-GENOME_URL="ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M36/GRCm39.primary_assembly.genome.fa.gz"
-GTF_URL="ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M36/gencode.vM36.primary_assembly.annotation.gtf.gz"
+GENOME_URL="https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M36/GRCm39.primary_assembly.genome.fa.gz"
+GTF_URL="https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M36/gencode.vM36.primary_assembly.annotation.gtf.gz"
+
+curl -sSL -o "${GENOME_FA}.gz" "$GENOME_URL"
+curl -sSL -o "${GTF_FILE}.gz"  "$GTF_URL"
 if [ ! -f reference/genome.fa.gz ]; then
     echo "Downloading GRCm39 genome FASTA..."
     curl -L -o reference/genome.fa.gz "$GENOME_URL"
