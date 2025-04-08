@@ -1,0 +1,32 @@
+#!/bin/bash
+set -euo pipefail
+# This script creates RNA-seq project directories with standard sub-folders.
+#
+# Usage: 
+#   You can run this script directly or embed it in an Automator app.
+#   Optionally, provide a base directory as an argument; otherwise, the default is $HOME/Desktop.
+#
+# The script creates three project folders: RNAseq-a, RNAseq-b, RNAseq-c.
+# Inside each project folder, it creates the following subfolders:
+# raw_data, trimmed_data, fastqc_results, alignment, counts, and analysis.
+
+# Set the base directory (first argument if provided, or default to Desktop)
+BASE_DIR="${1:-$HOME/Desktop}"
+
+# Define project folder names
+projects=( "RNAseq-a" "RNAseq-b" "RNAseq-c" )
+
+# Define standard subdirectories for each project
+subdirs=( "raw_data" "trimmed_data" "fastqc_results" "alignment" "counts" "analysis" )
+
+# Create folders for each project and its subdirectories
+for proj in "${projects[@]}"; do
+    proj_dir="$BASE_DIR/$proj"
+    mkdir -p "$proj_dir"
+    for sub in "${subdirs[@]}"; do
+        mkdir -p "$proj_dir/$sub"
+    done
+    echo "Created folder structure for $proj at $proj_dir"
+done
+
+echo "All project folders created successfully."
