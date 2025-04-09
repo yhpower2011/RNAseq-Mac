@@ -1,155 +1,207 @@
 #!/bin/bash
-set -euo pipefail
-set -x  # DEBUG: Print commands as they are executed
+set -euo pipefail  # Exit on error, undefined var, or pipeline failure
 
-# Extend PATH so Homebrew-installed tools (fastqc, STAR, etc.) are found.
-export PATH="$PATH:/usr/local/bin:/opt/homebrew/bin"
+# Ensure Homebrew binaries are in PATH (Automator provides a minimal PATH)
+export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
 
-# --------- CONFIGURATION ---------
-# Set the number of CPU threads to use.
-threads=4
+# If $HOME is not set (Automator environment), set it
+if [ -z "${HOME:-}" ]; then
+    HOME="/Users/$(whoami)"
+fi
 
-# Paths to reference files (update these if needed)
-STAR_INDEX="/path/to/STAR_index"       # e.g., directory built with STAR --genomeGenerate
-GTF_FILE="/path/to/annotation.gtf"       # Full path to gene annotation GTF file
+# Define base directory for project folders (default: Desktop)
+BASE_DIR="${BASE_DIR:-$HOME/Desktop}"
+cd "$BASE_DIR"
 
-# Adapter sequences for trimming (example: Illumina TruSeq adapters)
-adapter_fwd="AGATCGGAAGAGCACACGTCTGAACTCCAGTCA"
-adapter_rev="AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT"
+# Detect number of CPU cores for multi-threaded tools
+CPU_CORES=$(sysctl -n hw.logicalcpu 2>/dev/null || echo 8)
+THREADS="$CPU_CORES"
+echo "Detected $THREADS CPU threads. Using $THREADS threads for multi-threaded steps."
 
-# List of project folders (each should contain a subfolder "raw_data" with FASTQ files)
-projects=("RNAseq-a" "RNAseq-b" "RNAseq-c")
-# ---------------------------------
+# Define project names (modify this array as needed)
+projects=( "RNAseq-a" "RNAseq-b" "RNAseq-c" )
 
-echo "Starting RNA-seq pipeline..."
-
-for project in "${projects[@]}"; do
-  if [ ! -d "$project" ]; then
-    echo "Warning: Project directory '$project' not found, skipping."
-    continue
-  fi
-  
-  echo "=============================="
-  echo "Processing project: $project"
-  
-  cd "$project"
-
-  if [ ! -d "raw_data" ]; then
-    echo "Error: 'raw_data' subfolder not found in $project. Skipping project."
-    cd ..
-    continue
-  fi
-
-  mkdir -p fastqc_raw trimmed star_out
-
-  # Look for paired-end FASTQ files in raw_data folder:
-  shopt -s nullglob
-  fastq_files=(raw_data/*_R1.fastq.gz)
-  if [ ${#fastq_files[@]} -eq 0 ]; then
-    echo "No FASTQ files matching '*_R1.fastq.gz' found in $project/raw_data. Skipping project."
-    cd ..
-    continue
-  fi
-
-  for R1 in raw_data/*_R1.fastq.gz; do
-    R2="${R1/_R1.fastq.gz/_R2.fastq.gz}"
-    if [ ! -f "$R2" ]; then
-      echo "Warning: Matching R2 file for $R1 not found. Skipping sample."
-      continue
-    fi
-
-    r1_basename=$(basename "$R1")
-    sample="${r1_basename%%_R1.fastq.gz}"
-    echo "Processing sample: $sample"
-
-    # --- Step 1: FastQC on raw reads ---
-    if [ ! -f "fastqc_raw/${r1_basename%%.fastq.gz}_fastqc.html" ] || \
-       [ ! -f "fastqc_raw/$(basename "$R2" .fastq.gz)_fastqc.html" ]; then
-      echo "Running FastQC on $sample..."
-      fastqc --quiet -t 2 -o fastqc_raw "$R1" "$R2"
-      echo "FastQC completed for $sample."
-    else
-      echo "FastQC reports exist for $sample; skipping FastQC."
-    fi
-
-    # --- Step 2: Adapter trimming using cutadapt ---
-    trimmed_R1="trimmed/${sample}_R1_trimmed.fastq.gz"
-    trimmed_R2="trimmed/${sample}_R2_trimmed.fastq.gz"
-    if [ ! -f "$trimmed_R1" ] || [ ! -f "$trimmed_R2" ]; then
-      echo "Trimming adapters for $sample..."
-      cutadapt -j "$threads" -a "$adapter_fwd" -A "$adapter_rev" \
-               -o "$trimmed_R1" -p "$trimmed_R2" "$R1" "$R2"
-      echo "Trimming completed for $sample."
-    else
-      echo "Trimmed files exist for $sample; skipping trimming."
-    fi
-
-    # --- Step 3: STAR Alignment ---
-    aligned_bam="star_out/${sample}_Aligned.sortedByCoord.out.bam"
-    if [ ! -f "$aligned_bam" ]; then
-      echo "Running STAR alignment for $sample..."
-      STAR --runThreadN "$threads" \
-           --genomeDir "$STAR_INDEX" \
-           --readFilesIn "$trimmed_R1" "$trimmed_R2" \
-           --readFilesCommand zcat \
-           --outFileNamePrefix "star_out/${sample}_" \
-           --outSAMtype BAM SortedByCoordinate \
-           --outSAMunmapped Within \
-           --sjdbGTFfile "$GTF_FILE"
-      echo "STAR alignment completed for $sample."
-    else
-      echo "STAR alignment output exists for $sample; skipping alignment."
-    fi
-
-  done  # End sample loop
-
-  # --- Step 4: featureCounts ---
-  counts_file="../${project}_counts.txt"
-  if [ ! -f "$counts_file" ]; then
-    bam_files=(star_out/*_Aligned.sortedByCoord.out.bam)
-    if [ ${#bam_files[@]} -gt 0 ]; then
-      echo "Running featureCounts for $project on ${#bam_files[@]} BAM files..."
-      featureCounts -T "$threads" -p -t exon -g gene_id -a "$GTF_FILE" -o "$counts_file" "${bam_files[@]}"
-      echo "featureCounts completed for $project."
-    else
-      echo "No aligned BAM files in star_out; skipping featureCounts for $project."
-    fi
-  else
-    echo "Counts file for $project already exists; skipping featureCounts."
-  fi
-
-  # --- Step 5: DESeq2 Differential Expression Analysis ---
-  deseq_file="../${project}_deseq2_results.csv"
-  if [ ! -f "$deseq_file" ]; then
-    echo "Running DESeq2 analysis for $project..."
-    Rscript --vanilla - <<'EOF'
-suppressMessages(library(DESeq2))
-args <- commandArgs(trailingOnly = TRUE)
-counts_path <- args[1]
-counts <- read.table(counts_path, header=TRUE, row.names=1, comment.char="#")
-counts <- counts[ , -(1:5)]
-samples <- colnames(counts)
-conditions <- sapply(samples, function(x) { unlist(strsplit(x, "_"))[1] })
-conditions <- factor(conditions)
-coldata <- data.frame(condition=conditions, row.names=samples)
-dds <- DESeqDataSetFromMatrix(countData = counts, colData = coldata, design = ~ condition)
-dds <- DESeq(dds)
-res <- results(dds)
-res <- res[order(res$padj), ]
-write.csv(as.data.frame(res), file=gsub("counts", "deseq2_results", counts_path))
-EOF
-    # Check if DESeq2 produced the results file.
-    if [ -f "../${project}_deseq2_results.csv" ]; then
-      echo "DESeq2 analysis completed for $project."
-    else
-      echo "DESeq2 analysis may have failed for $project."
-    fi
-  else
-    echo "DESeq2 results for $project already exist; skipping DESeq2 analysis."
-  fi
-
-  cd ..
-  echo "Finished processing project: $project"
+# Create project directories and sub-folders
+for proj in "${projects[@]}"; do
+    mkdir -p "$proj/raw_data" "$proj/fastqc_results" "$proj/trimmed_data" "$proj/alignment" "$proj/counts" "$proj/analysis"
 done
+echo "Projects created under $BASE_DIR: ${projects[*]} (with sub-folders)."
 
-echo "RNA-seq pipeline completed for all projects."
+# Prepare reference genome and annotation (download if not already present)
+mkdir -p reference
+GENOME_FA="reference/genome.fa"
+GTF_FILE="reference/annotation.gtf"
+GENOME_URL="https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M36/GRCm39.primary_assembly.genome.fa.gz"
+GTF_URL="https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M36/gencode.vM36.primary_assembly.annotation.gtf.gz"
+# Download reference files if not already downloaded
+if [ ! -f "${GENOME_FA}.gz" ]; then
+    echo "Downloading GRCm39 genome FASTA (mouse reference genome)..."
+    curl -sSL -o "${GENOME_FA}.gz" "$GENOME_URL"
+fi
+if [ ! -f "${GTF_FILE}.gz" ]; then
+    echo "Downloading GENCODE vM36 annotation GTF (mouse gene annotations)..."
+    curl -sSL -o "${GTF_FILE}.gz" "$GTF_URL"
+fi
+# Decompress reference files if not already decompressed
+if [ ! -f "$GENOME_FA" ]; then
+    gunzip -c "${GENOME_FA}.gz" > "$GENOME_FA"
+fi
+if [ ! -f "$GTF_FILE" ]; then
+    gunzip -c "${GTF_FILE}.gz" > "$GTF_FILE"
+fi
+# Build STAR index if not already built (using sjdbOverhang=149 for 150 bp reads)
+if [ ! -d reference/STARindex ]; then
+    echo "Building STAR index (sjdbOverhang=149 for 150 bp reads)..."
+    mkdir -p reference/STARindex
+    STAR --runThreadN $THREADS --runMode genomeGenerate \
+         --genomeDir reference/STARindex \
+         --genomeFastaFiles "$GENOME_FA" \
+         --sjdbGTFfile "$GTF_FILE" \
+         --sjdbOverhang 149
+    echo "STAR index built in reference/STARindex."
+fi
+
+# Set path to Trimmomatic adapter file (TruSeq3-PE adapters)
+ADAPTER_FILE="$(brew --prefix)/share/trimmomatic/adapters/TruSeq3-PE.fa"
+
+# Loop over each project and process the FASTQ files
+for proj in "${projects[@]}"; do
+    echo ">>> Processing project: $proj"
+    # Only proceed if raw FASTQ files exist in the project folder
+    if compgen -G "$proj/raw_data/*_R1*.fastq*" > /dev/null; then
+
+        # 1. Quality Control with FastQC
+        echo "Running FastQC on raw reads in $proj/raw_data/ ..."
+        mkdir -p "$proj/fastqc_results"
+        # Skip FastQC if results already exist
+        if compgen -G "$proj/fastqc_results/*_fastqc.html" > /dev/null; then
+            echo "FastQC outputs already exist for $proj, skipping FastQC."
+        else
+            fastqc -t $THREADS -o "$proj/fastqc_results" "$proj/raw_data"/*fastq*
+            echo "FastQC reports saved to $proj/fastqc_results."
+        fi
+
+        # 2. Adapter and quality trimming with Trimmomatic (paired-end)
+        for f1 in "$proj"/raw_data/*_R1*.fastq*; do
+            f2="${f1/_R1/_R2}"  # corresponding R2 file
+            sampleName="$(basename "$f1")"
+            sampleName="${sampleName%%_R1*}"  # sample name prefix (before _R1)
+            out1="$proj/trimmed_data/${sampleName}_R1_trimmed_paired.fastq.gz"
+            out1_un="$proj/trimmed_data/${sampleName}_R1_trimmed_unpaired.fastq.gz"
+            out2="$proj/trimmed_data/${sampleName}_R2_trimmed_paired.fastq.gz"
+            out2_un="$proj/trimmed_data/${sampleName}_R2_trimmed_unpaired.fastq.gz"
+            echo "Trimming adapters and low-quality bases for sample $sampleName ..."
+            # Skip trimming if outputs already exist
+            if [ -f "$out1" ] && [ -f "$out2" ]; then
+                echo "Trimmed FASTQ files already exist for $sampleName, skipping Trimmomatic."
+            else
+                trimmomatic PE -threads $THREADS -phred33 \
+                    "$f1" "$f2" \
+                    "$out1" "$out1_un" "$out2" "$out2_un" \
+                    ILLUMINACLIP:"$ADAPTER_FILE":2:30:10 SLIDINGWINDOW:4:20 MINLEN:36
+                # Trimmomatic outputs stats to stdout; trimmed reads are saved in trimmed_data/
+            fi
+        done
+        echo "Trimming completed for $proj. Trimmed reads are in $proj/trimmed_data."
+
+        # 3. Alignment with STAR for each sample
+        for f1 in "$proj/trimmed_data"/*_R1_trimmed_paired.fastq.gz; do
+            f2="${f1/_R1_trimmed_paired/_R2_trimmed_paired}"  # mate 2 file
+            sampleBase="$(basename "$f1" "_R1_trimmed_paired.fastq.gz")"
+            echo "Aligning sample $sampleBase with STAR ..."
+            # Skip STAR alignment if sorted BAM already exists
+            if [ -f "$proj/alignment/${sampleBase}_sorted.bam" ]; then
+                echo "Sorted BAM for $sampleBase already exists, skipping STAR alignment."
+            else
+                STAR --runThreadN $THREADS --genomeDir reference/STARindex \
+                     --readFilesIn "$f1" "$f2" --readFilesCommand zcat \
+                     --outFileNamePrefix "$proj/alignment/${sampleBase}_" \
+                     --outSAMtype BAM Unsorted
+                # STAR outputs an unsorted BAM named "${sampleBase}_Aligned.out.bam"
+                samtools sort -@ $THREADS -o "$proj/alignment/${sampleBase}_sorted.bam" \
+                     "$proj/alignment/${sampleBase}_Aligned.out.bam"
+                samtools index -@ $THREADS "$proj/alignment/${sampleBase}_sorted.bam"
+                rm "$proj/alignment/${sampleBase}_Aligned.out.bam"  # remove intermediate unsorted BAM
+                echo "STAR alignment finished for $sampleBase (sorted BAM ready)."
+            fi
+        done
+
+        # 4. Gene counting with featureCounts
+        if [ -f "$proj/counts/gene_counts.txt" ]; then
+            echo "featureCounts output already exists for $proj, skipping counting."
+        else
+            echo "Counting reads with featureCounts (using GENCODE annotation)..."
+            featureCounts -T $THREADS -p -t exon -g gene_id -a "$GTF_FILE" \
+                         -o "$proj/counts/gene_counts.txt" "$proj/alignment"/*_sorted.bam
+            echo "Gene counts saved to $proj/counts/gene_counts.txt."
+        fi
+
+        # 5. Differential expression and GO enrichment analysis with R (DESeq2 + clusterProfiler)
+        if [ -f "$proj/analysis/deseq2_results.csv" ]; then
+            echo "DESeq2 results already exist for $proj, skipping DESeq2 analysis."
+        else
+            echo "Running DESeq2 differential expression and GO enrichment analysis for $proj..."
+            pushd "$proj" > /dev/null  # enter project directory for R analysis
+            Rscript <<'RSCRIPT'
+# Load required libraries quietly
+suppressMessages(library(DESeq2))
+suppressMessages(library(clusterProfiler))
+suppressMessages(library(org.Mm.eg.db))
+# Read in featureCounts output
+count_data <- read.table("counts/gene_counts.txt", header=TRUE, sep="\t", comment.char="#")
+# Use gene IDs as row names and drop extra columns from featureCounts
+rownames(count_data) <- count_data$Geneid
+count_data <- count_data[, !(colnames(count_data) %in% c("Geneid","Chr","Start","End","Strand","Length"))]
+# Simplify column names (remove file extensions)
+colnames(count_data) <- sub(".sorted.bam$", "", sub(".bam$", "", colnames(count_data)))
+# Infer conditions from filenames (expects "control" or "treatment" in file names)
+sample_names <- colnames(count_data)
+conditions <- ifelse(grepl("control", sample_names, ignore.case=TRUE), "control",
+                     ifelse(grepl("treatment", sample_names, ignore.case=TRUE), "treatment", NA))
+conditions <- factor(conditions)
+coldata <- data.frame(row.names=sample_names, condition=conditions)
+# Run DESeq2 differential expression analysis
+dds <- DESeqDataSetFromMatrix(count_data, colData=coldata, design=~condition)
+dds <- DESeq(dds)
+res <- results(dds, alpha=0.05)  # results with FDR <= 0.05
+res <- res[order(res$padj), ]    # sort by adjusted p-value
+res_df <- as.data.frame(res)
+write.csv(res_df, file="analysis/deseq2_results.csv")
+# Plot PCA of samples
+vsd <- vst(dds)
+png("analysis/PCA_plot.png", width=800, height=600)
+print(plotPCA(vsd, intgroup="condition"))
+dev.off()
+# Plot MA (Mean vs Fold-change)
+png("analysis/MA_plot.png", width=800, height=600)
+plotMA(res, main="DESeq2 MA-Plot", ylim=c(-5,5))
+dev.off()
+# Plot Volcano (highlight significant genes)
+res_df$minusLog10P <- -log10(res_df$pvalue)
+res_df$signif <- !is.na(res_df$padj) & res_df$padj < 0.05
+png("analysis/Volcano_plot.png", width=800, height=600)
+with(res_df, plot(log2FoldChange, minusLog10P, pch=20,
+                  col=ifelse(signif, "red", "gray"),
+                  xlab="Log2 Fold Change", ylab="-Log10 p-value", main="Volcano Plot"))
+dev.off()
+# GO enrichment analysis for significant genes (padj < 0.05)
+sig_genes <- rownames(res_df)[res_df$signif]
+ego <- enrichGO(gene=sig_genes, OrgDb=org.Mm.eg.db, keyType="ENSEMBL", ont="BP",
+                pAdjustMethod="BH", pvalueCutoff=0.05, qvalueCutoff=0.05)
+ego_df <- as.data.frame(ego)
+write.csv(ego_df, file="analysis/GO_enrichment_results.csv")
+if (nrow(ego_df) > 0) {
+    png("analysis/GO_enrichment_top10.png", width=800, height=600)
+    print(dotplot(ego, showCategory=10) + ggplot2::ggtitle("Top 10 GO terms"))
+    dev.off()
+}
+RSCRIPT
+            popd > /dev/null  # return to base directory
+            echo "DESeq2 and GO enrichment analysis complete for $proj (results in $proj/analysis/)."
+        fi
+
+    else
+        echo "No FASTQ files found in $proj/raw_data/ – skipping analysis for $proj."
+    fi
+done
+echo "=== RNA-seq pipeline completed ==="
