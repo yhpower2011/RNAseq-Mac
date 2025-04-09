@@ -121,7 +121,7 @@ for proj in "${projects[@]}"; do
             echo "    FastQC results found → skipping FastQC."
         else
             echo "    Running FastQC on raw reads..."
-            fastqc -t "$THREADS" -o "$proj/fastqc_results" "$proj/raw_data"/*fastq*
+            fastqc -t "$THREADS" -o "$proj/fastqc_results" "$proj/raw_data"/*fastq* >/dev/null 2>&1
             echo "    FastQC done."
         fi
 
