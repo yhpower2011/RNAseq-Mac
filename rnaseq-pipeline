@@ -1,23 +1,16 @@
 #!/bin/bash
-# RNA-seq Processing Pipeline for macOS Automator
-# Revised: April 2025 by ChatGPT
-# This script processes paired-end FASTQ files for three projects (RNAseq-a, RNAseq-b, RNAseq-c)
-# and performs quality control, adapter trimming, alignment with STAR, gene counting, and DESeq2 analysis.
-# It checks for each step's outputs to allow for smart re-runs.
-
 set -euo pipefail
+set -x  # DEBUG: Print commands as they are executed
 
 # Extend PATH so Homebrew-installed tools (fastqc, STAR, etc.) are found.
 export PATH="$PATH:/usr/local/bin:/opt/homebrew/bin"
 
 # --------- CONFIGURATION ---------
-# Set the number of CPU threads to use (adjust for your iMac Pro)
-threads=16
+# Set the number of CPU threads to use.
+threads=4
 
 # Paths to reference files (update these if needed)
-# (STAR_INDEX and GTF_FILE are assumed already built or provided; if you need to build the STAR index,
-#  do that outside this script or add a separate step.)
-STAR_INDEX="/path/to/STAR_index"       # e.g., a directory built with STAR --genomeGenerate
+STAR_INDEX="/path/to/STAR_index"       # e.g., directory built with STAR --genomeGenerate
 GTF_FILE="/path/to/annotation.gtf"       # Full path to gene annotation GTF file
 
 # Adapter sequences for trimming (example: Illumina TruSeq adapters)
@@ -30,7 +23,6 @@ projects=("RNAseq-a" "RNAseq-b" "RNAseq-c")
 
 echo "Starting RNA-seq pipeline..."
 
-# Loop over each project folder:
 for project in "${projects[@]}"; do
   if [ ! -d "$project" ]; then
     echo "Warning: Project directory '$project' not found, skipping."
@@ -42,18 +34,16 @@ for project in "${projects[@]}"; do
   
   cd "$project"
 
-  # Check that the raw_data folder exists
   if [ ! -d "raw_data" ]; then
     echo "Error: 'raw_data' subfolder not found in $project. Skipping project."
     cd ..
     continue
   fi
 
-  # Create output directories if they do not exist.
   mkdir -p fastqc_raw trimmed star_out
 
-  # Look for paired-end FASTQ files in the raw_data folder:
-  shopt -s nullglob  # If no files match, the loop will be skipped.
+  # Look for paired-end FASTQ files in raw_data folder:
+  shopt -s nullglob
   fastq_files=(raw_data/*_R1.fastq.gz)
   if [ ${#fastq_files[@]} -eq 0 ]; then
     echo "No FASTQ files matching '*_R1.fastq.gz' found in $project/raw_data. Skipping project."
@@ -61,22 +51,18 @@ for project in "${projects[@]}"; do
     continue
   fi
 
-  # Process each sample in raw_data folder:
   for R1 in raw_data/*_R1.fastq.gz; do
-    # Derive R2 file name by replacing "_R1.fastq.gz" with "_R2.fastq.gz"
     R2="${R1/_R1.fastq.gz/_R2.fastq.gz}"
     if [ ! -f "$R2" ]; then
       echo "Warning: Matching R2 file for $R1 not found. Skipping sample."
       continue
     fi
 
-    # Obtain a sample name (basename without the directory and suffix)
     r1_basename=$(basename "$R1")
     sample="${r1_basename%%_R1.fastq.gz}"
     echo "Processing sample: $sample"
 
     # --- Step 1: FastQC on raw reads ---
-    # Check if FastQC reports for both R1 and R2 exist (HTML reports in fastqc_raw)
     if [ ! -f "fastqc_raw/${r1_basename%%.fastq.gz}_fastqc.html" ] || \
        [ ! -f "fastqc_raw/$(basename "$R2" .fastq.gz)_fastqc.html" ]; then
       echo "Running FastQC on $sample..."
@@ -87,7 +73,6 @@ for project in "${projects[@]}"; do
     fi
 
     # --- Step 2: Adapter trimming using cutadapt ---
-    # Define trimmed output files; save in the "trimmed" folder.
     trimmed_R1="trimmed/${sample}_R1_trimmed.fastq.gz"
     trimmed_R2="trimmed/${sample}_R2_trimmed.fastq.gz"
     if [ ! -f "$trimmed_R1" ] || [ ! -f "$trimmed_R2" ]; then
@@ -100,7 +85,6 @@ for project in "${projects[@]}"; do
     fi
 
     # --- Step 3: STAR Alignment ---
-    # Define output BAM file name (placed in star_out)
     aligned_bam="star_out/${sample}_Aligned.sortedByCoord.out.bam"
     if [ ! -f "$aligned_bam" ]; then
       echo "Running STAR alignment for $sample..."
@@ -120,9 +104,7 @@ for project in "${projects[@]}"; do
   done  # End sample loop
 
   # --- Step 4: featureCounts ---
-  # Generate a counts file for all BAM files in the star_out folder.
   counts_file="../${project}_counts.txt"
-  # Only run featureCounts if the counts file does not already exist.
   if [ ! -f "$counts_file" ]; then
     bam_files=(star_out/*_Aligned.sortedByCoord.out.bam)
     if [ ${#bam_files[@]} -gt 0 ]; then
@@ -139,20 +121,14 @@ for project in "${projects[@]}"; do
   # --- Step 5: DESeq2 Differential Expression Analysis ---
   deseq_file="../${project}_deseq2_results.csv"
   if [ ! -f "$deseq_file" ]; then
-    # For DESeq2, we run an R script. Here we assume that the counts file is formatted correctly.
     echo "Running DESeq2 analysis for $project..."
     Rscript --vanilla - <<'EOF'
 suppressMessages(library(DESeq2))
 args <- commandArgs(trailingOnly = TRUE)
-# The counts file is provided as the first argument
 counts_path <- args[1]
-# Read the counts file (skip lines starting with # if needed)
 counts <- read.table(counts_path, header=TRUE, row.names=1, comment.char="#")
-# Remove the first 5 annotation columns added by featureCounts
 counts <- counts[ , -(1:5)]
-# Use column names directly as sample names
 samples <- colnames(counts)
-# Assume condition is encoded in sample names (split at underscore)
 conditions <- sapply(samples, function(x) { unlist(strsplit(x, "_"))[1] })
 conditions <- factor(conditions)
 coldata <- data.frame(condition=conditions, row.names=samples)
@@ -162,9 +138,7 @@ res <- results(dds)
 res <- res[order(res$padj), ]
 write.csv(as.data.frame(res), file=gsub("counts", "deseq2_results", counts_path))
 EOF
-    # Pass the counts file path as argument to the R script.
-    Rscript_arg="$counts_file"
-    # The above R script will produce a CSV with "deseq2_results" in its name.
+    # Check if DESeq2 produced the results file.
     if [ -f "../${project}_deseq2_results.csv" ]; then
       echo "DESeq2 analysis completed for $project."
     else
@@ -174,7 +148,6 @@ EOF
     echo "DESeq2 results for $project already exist; skipping DESeq2 analysis."
   fi
 
-  # Return to the base directory for the next project.
   cd ..
   echo "Finished processing project: $project"
 done
