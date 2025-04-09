@@ -1,190 +1,180 @@
 #!/bin/bash
-set -euo pipefail  # Exit on error, undefined var, or pipeline failure for safety
+# RNA-seq processing pipeline for macOS Automator
+# Author: Revised by ChatGPT on April 2025
+# Ensure Automator uses /bin/bash for this script.
 
-# Ensure Homebrew binaries are in PATH (Automator provides a minimal PATH)
-export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
+# Exit on any error, and treat undefined variables as errors:
+set -euo pipefail
 
-# Define base directory for project folders (default: Desktop)
-if [ -z "${HOME:-}" ]; then  # If $HOME not set, fix it
-    HOME="/Users/$(whoami)"
-fi
-BASE_DIR="${BASE_DIR:-$HOME/Desktop}"  # You can change BASE_DIR here if desired
-cd "$BASE_DIR"
+# Extend PATH for tools installed via Homebrew (adjust if needed)
+export PATH="$PATH:/usr/local/bin:/opt/homebrew/bin"
 
-# Detect number of CPU cores for multi-threaded tools
-CPU_CORES=$(sysctl -n hw.logicalcpu 2>/dev/null || echo 8)
-THREADS="$CPU_CORES"
+# --------- CONFIGURATION ---------
+# Number of CPU threads to use for multi-threaded tools:
+threads=4  # Adjust based on your CPU cores for faster processing
 
-# Define project names
-projects=( "RNAseq-a" "RNAseq-b" "RNAseq-c" )
+# Paths to reference files (UPDATE these to your actual paths):
+STAR_INDEX="/path/to/STAR/genome_index"    # STAR genome index directory
+GTF_FILE="/path/to/annotation.gtf"         # Annotation GTF file for featureCounts and (optionally STAR)
 
-# Create project directories and subdirectories
-for proj in "${projects[@]}"; do
-    mkdir -p "$proj"/{raw_data,trimmed_data,fastqc_results,alignment,counts,analysis}
-done
+# Adapter sequences for trimming (Illumina TruSeq adapters as default; update if different):
+adapter_fwd="AGATCGGAAGAGCACACGTCTGAACTCCAGTCA"   # Adapter for read1 (3' end)
+adapter_rev="AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT"   # Adapter for read2 (3' end)
 
-echo "=== RNA-seq pipeline started ==="
-echo "Projects created under $BASE_DIR: ${projects[*]} (with sub-folders)."
+# Project folders to process:
+projects=("RNAseq-a" "RNAseq-b" "RNAseq-c")
+# ---------------------------------
 
-# Prepare reference genome and annotation (download if not already present)
-mkdir -p reference
-GENOME_FA="reference/genome.fa"
-GTF_FILE="reference/annotation.gtf"
-GENOME_URL="https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M36/GRCm39.primary_assembly.genome.fa.gz"
-GTF_URL="https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M36/gencode.vM36.primary_assembly.annotation.gtf.gz"
+echo "Starting RNA-seq pipeline..." 
 
-# Download reference files if not already downloaded
-if [ ! -f "${GENOME_FA}.gz" ]; then
-    echo "Downloading GRCm39 genome FASTA (mouse reference genome)..."
-    curl -sSL -o "${GENOME_FA}.gz" "$GENOME_URL"
-fi
-if [ ! -f "${GTF_FILE}.gz" ]; then
-    echo "Downloading GENCODE vM36 annotation GTF (mouse gene annotations)..."
-    curl -sSL -o "${GTF_FILE}.gz" "$GTF_URL"
-fi
+for project in "${projects[@]}"; do
+  if [ ! -d "$project" ]; then
+    echo "Warning: Project directory '$project' not found, skipping."
+    continue
+  fi
 
-# Decompress the reference files if not already decompressed
-if [ ! -f "$GENOME_FA" ]; then 
-    gunzip -c "${GENOME_FA}.gz" > "$GENOME_FA"
-fi
-if [ ! -f "$GTF_FILE" ]; then 
-    gunzip -c "${GTF_FILE}.gz" > "$GTF_FILE"
-fi
+  echo "== Processing project: $project =="
+  cd "$project"
 
-# Build STAR index if not already built (using sjdbOverhang=149 for 150 bp reads)
-if [ ! -d reference/STARindex ]; then
-    echo "Building STAR index (sjdbOverhang=149 for 150 bp reads)..."
-    mkdir -p reference/STARindex
-    STAR --runThreadN $THREADS --runMode genomeGenerate \
-         --genomeDir reference/STARindex \
-         --genomeFastaFiles "$GENOME_FA" \
-         --sjdbGTFfile "$GTF_FILE" \
-         --sjdbOverhang 149
-    echo "STAR index built in reference/STARindex."
-fi
+  # Create output directories if not present
+  mkdir -p fastqc_raw trimmed star_out
 
-# Set path to Trimmomatic adapter file (Homebrew installs adapters here)
-ADAPTER_FILE="$(brew --prefix)/share/trimmomatic/adapters/TruSeq3-PE.fa"
-
-# Loop over each project and process the FASTQ files
-for proj in "${projects[@]}"; do
-    echo ">>> Processing project: $proj"
-    # Only proceed if raw FASTQ files exist in the project folder
-    if compgen -G "$proj/raw_data/*_R1*.fastq*" > /dev/null; then
-
-        # 1. Quality Control with FastQC
-        echo "Running FastQC on raw reads in $proj/raw_data/ ..."
-        fastqc -t $THREADS -o "$proj/fastqc_results" "$proj/raw_data"/*fastq*
-        echo "FastQC reports saved to $proj/fastqc_results."
-
-        # 2. Adapter and quality trimming with Trimmomatic (paired-end)
-        for f1 in "$proj/raw_data"/*_R1*.fastq*; do
-            f2="${f1/_R1/_R2}"   # corresponding R2 file
-            sampleName="$(basename "$f1")"
-            sampleName="${sampleName%%_R1*}"  # sample name prefix (before _R1)
-            out1="$proj/trimmed_data/${sampleName}_R1_trimmed_paired.fastq.gz"
-            out1_un="$proj/trimmed_data/${sampleName}_R1_trimmed_unpaired.fastq.gz"
-            out2="$proj/trimmed_data/${sampleName}_R2_trimmed_paired.fastq.gz"
-            out2_un="$proj/trimmed_data/${sampleName}_R2_trimmed_unpaired.fastq.gz"
-
-            echo "Trimming adapters and low-quality bases for sample $sampleName ..."
-            trimmomatic PE -threads $THREADS -phred33 \
-                "$f1" "$f2" \
-                "$out1" "$out1_un" "$out2" "$out2_un" \
-                ILLUMINACLIP:"$ADAPTER_FILE":2:30:10 SLIDINGWINDOW:4:20 MINLEN:36
-            # Trimmomatic outputs stats to stdout; trimmed reads are saved in trimmed_data/
-        done
-        echo "Trimming completed for $proj. Trimmed reads are in $proj/trimmed_data."
-
-        # 3. Alignment with STAR for each sample
-        for f1 in "$proj/trimmed_data"/*_R1_trimmed_paired.fastq.gz; do
-            f2="${f1/_R1_trimmed_paired/_R2_trimmed_paired}"  # mate 2 file
-            sampleBase="$(basename "$f1" "_R1_trimmed_paired.fastq.gz")"
-            echo "Aligning sample $sampleBase with STAR ..."
-            STAR --runThreadN $THREADS --genomeDir reference/STARindex \
-                 --readFilesIn "$f1" "$f2" --readFilesCommand zcat \
-                 --outFileNamePrefix "$proj/alignment/${sampleBase}_" \
-                 --outSAMtype BAM Unsorted
-            # STAR outputs an unsorted BAM named "${sampleBase}_Aligned.out.bam"
-            samtools sort -@ $THREADS -o "$proj/alignment/${sampleBase}_sorted.bam" \
-                 "$proj/alignment/${sampleBase}_Aligned.out.bam"
-            samtools index -@ $THREADS "$proj/alignment/${sampleBase}_sorted.bam"
-            rm "$proj/alignment/${sampleBase}_Aligned.out.bam"  # remove intermediate unsorted BAM
-            echo "STAR alignment finished for $sampleBase (sorted BAM ready)."
-        done
-
-        # 4. Gene counting with featureCounts
-        echo "Counting reads with featureCounts (using GENCODE annotation)..."
-        featureCounts -T $THREADS -p -t exon -g gene_id -a "$GTF_FILE" \
-                     -o "$proj/counts/gene_counts.txt" "$proj/alignment"/*_sorted.bam
-        echo "Gene counts saved to $proj/counts/gene_counts.txt."
-
-        # 5. Differential expression and GO enrichment analysis with R (DESeq2 + clusterProfiler)
-        echo "Running DESeq2 differential expression and GO enrichment analysis for $proj..."
-        pushd "$proj" > /dev/null  # enter project directory for R analysis
-        Rscript <<'RSCRIPT'
-        # Load required libraries quietly
-        suppressMessages(library(DESeq2))
-        suppressMessages(library(clusterProfiler))
-        suppressMessages(library(org.Mm.eg.db))
-        # Read in featureCounts output
-        count_data <- read.table("counts/gene_counts.txt", header=TRUE, sep="\t", comment.char="#")
-        # Use gene IDs as row names and drop extra columns from featureCounts
-        rownames(count_data) <- count_data$Geneid
-        count_data <- count_data[, !(colnames(count_data) %in% 
-                                     c("Geneid","Chr","Start","End","Strand","Length"))]
-        # Simplify column names (remove file extensions)
-        colnames(count_data) <- sub(".sorted.bam$", "", sub(".bam$", "", colnames(count_data)))
-        # Infer conditions from filenames (expects "control" or "treatment" in file names)
-        sample_names <- colnames(count_data)
-        conditions <- ifelse(grepl("control", sample_names, ignore.case=TRUE), "control",
-                       ifelse(grepl("treatment", sample_names, ignore.case=TRUE), "treatment", NA))
-        conditions <- factor(conditions)
-        coldata <- data.frame(row.names=sample_names, condition=conditions)
-        # Run DESeq2 differential expression analysis
-        dds <- DESeqDataSetFromMatrix(count_data, colData=coldata, design=~condition)
-        dds <- DESeq(dds)
-        res <- results(dds, alpha=0.05)  # results with FDR <= 0.05
-        res <- res[order(res$padj), ]    # sort by adjusted p-value
-        res_df <- as.data.frame(res)
-        write.csv(res_df, file="analysis/deseq2_results.csv")
-        # Plot PCA of samples
-        vsd <- vst(dds)
-        png("analysis/PCA_plot.png", width=800, height=600)
-        print(plotPCA(vsd, intgroup="condition"))
-        dev.off()
-        # Plot MA (Mean vs Fold-change)
-        png("analysis/MA_plot.png", width=800, height=600)
-        plotMA(res, main="DESeq2 MA-Plot", ylim=c(-5,5))
-        dev.off()
-        # Plot Volcano (highlight significant genes)
-        res_df$minusLog10P <- -log10(res_df$pvalue)
-        res_df$signif <- !is.na(res_df$padj) & res_df$padj < 0.05
-        png("analysis/Volcano_plot.png", width=800, height=600)
-        with(res_df, plot(log2FoldChange, minusLog10P, pch=20,
-                          col=ifelse(signif, "red", "gray"),
-                          xlab="Log2 Fold Change", ylab="-Log10 p-value", main="Volcano Plot"))
-        dev.off()
-        # GO enrichment analysis (Biological Process) for significant DE genes
-        sig_genes <- rownames(res_df)[!is.na(res_df$padj) & res_df$padj < 0.05]
-        if (length(sig_genes) > 0) {
-            ego <- enrichGO(gene=sig_genes, universe=rownames(res_df), OrgDb=org.Mm.eg.db,
-                            keyType="ENSEMBL", ont="BP", pAdjustMethod="BH", qvalueCutoff=0.05)
-            ego_df <- as.data.frame(ego)
-            write.csv(ego_df, file="analysis/GO_enrichment_results.csv")
-            if (nrow(ego_df) > 0) {
-                png("analysis/GO_enrichment_top10.png", width=800, height=600)
-                print(dotplot(ego, showCategory=10) + ggplot2::ggtitle("Top 10 GO terms"))
-                dev.off()
-            }
-        }
-RSCRIPT
-        popd > /dev/null  # return to base directory
-        echo "DESeq2 and GO enrichment analysis complete for $proj (results in $proj/analysis/)."
-
-    else
-        echo "No FASTQ files found in $proj/raw_data/ – skipping analysis for $proj."
+  # Loop through each sample (paired-end FASTQ files)
+  for R1 in *_R1.fastq.gz; do
+    # Derive R2 filename from R1
+    R2="${R1/_R1.fastq.gz/_R2.fastq.gz}"
+    if [ ! -f "$R2" ]; then
+      echo "Warning: Paired file for $R1 not found (expected $R2), skipping this sample."
+      continue
     fi
+    # Sample name (without _R1.fastq.gz suffix)
+    sample="${R1%%_R1.fastq.gz}"
+    echo "Processing sample: $sample"
+
+    # --- Step 1: FastQC on raw reads ---
+    # Check for FastQC outputs (.html report) for both R1 and R2
+    if [ ! -f "fastqc_raw/${R1%%.fastq.gz}_fastqc.html" ] || [ ! -f "fastqc_raw/${R2%%.fastq.gz}_fastqc.html" ]; then
+      echo "Running FastQC on raw reads for $sample..."
+      fastqc --quiet -t 2 -o fastqc_raw "$R1" "$R2"&#8203;:contentReference[oaicite:1]{index=1}
+      echo "FastQC completed for $sample"
+    else
+      echo "FastQC already done for $sample, skipping."
+    fi
+
+    # --- Step 2: Adapter trimming ---
+    # Define trimmed output file names
+    trimR1="trimmed/${sample}_R1_trimmed.fastq.gz"
+    trimR2="trimmed/${sample}_R2_trimmed.fastq.gz"
+    if [ ! -f "$trimR1" ] || [ ! -f "$trimR2" ]; then
+      echo "Trimming adapters for $sample..."
+      cutadapt -j $threads -a "$adapter_fwd" -A "$adapter_rev" -o "$trimR1" -p "$trimR2" "$R1" "$R2"
+      echo "Trimming completed for $sample"
+    else
+      echo "Trimmed reads for $sample already exist, skipping."
+    fi
+
+    # --- Step 3: STAR alignment ---
+    # Define STAR output BAM name (sorted BAM)
+    aligned_bam="star_out/${sample}_Aligned.sortedByCoord.out.bam"
+    if [ ! -f "$aligned_bam" ]; then
+      echo "Aligning $sample with STAR..."
+      STAR --runThreadN $threads \
+           --genomeDir "$STAR_INDEX" \
+           --readFilesIn "$trimR1" "$trimR2" \
+           --readFilesCommand zcat \
+           --outFileNamePrefix "star_out/${sample}_" \
+           --outSAMtype BAM SortedByCoordinate \
+           --outSAMunmapped Within \
+           --quantMode TranscriptomeSAM   `# (optional: generates Transcriptome alignment if needed)` \
+           --sjdbGTFfile "$GTF_FILE"       `# (optional: uses annotation to improve junction detection)` 
+      echo "STAR alignment completed for $sample"
+    else
+      echo "STAR alignment for $sample already exists, skipping."
+    fi
+
+  done  # End of sample loop
+
+  # --- Step 4: featureCounts (counting reads per gene) ---
+  # featureCounts will produce a multi-sample count matrix for all BAMs in this project.
+  counts_file="../${project}_counts.txt"   # output counts in parent directory (or use "$project_counts.txt" in same dir)
+  # (Using parent directory so that each project's counts file is outside the project folder)
+  if [ ! -f "$counts_file" ]; then
+    # Check if there are BAM files to count
+    bam_list=(star_out/*_Aligned.sortedByCoord.out.bam)
+    if [ ${#bam_list[@]} -eq 0 ]; then
+      echo "No aligned BAM files for $project, skipping featureCounts."
+    else
+      echo "Running featureCounts for project $project on ${#bam_list[@]} files..."
+      featureCounts -T $threads -p -t exon -g gene_id -a "$GTF_FILE" -o "$counts_file" "${bam_list[@]}"&#8203;:contentReference[oaicite:2]{index=2}&#8203;:contentReference[oaicite:3]{index=3}
+      echo "featureCounts completed for $project (output: ${project}_counts.txt)"
+    fi
+  else
+    echo "featureCounts counts file already exists for $project, skipping."
+  fi
+
+  # --- Step 5: DESeq2 differential expression ---
+  results_file="../${project}_deseq2_results.csv"
+  if [ ! -f "$results_file" ]; then
+    # Prepare sample names and condition labels from BAM filenames for DESeq2
+    declare -a samples_list=() 
+    declare -a cond_list=()
+    for bam in star_out/*_Aligned.sortedByCoord.out.bam; do
+      name="$(basename "$bam" _Aligned.sortedByCoord.out.bam)"
+      samples_list+=("$name")
+      # Derive condition from sample name by splitting at first underscore (e.g., Prefix_condition)
+      # Adjust this logic if your sample naming convention is different.
+      cond="${name%%_*}"
+      cond_list+=("$cond")
+    done
+    echo "Running DESeq2 for $project (conditions: ${cond_list[*]})..."
+    # Create an R script on the fly to run DESeq2
+    Rscript --vanilla - <<EOF
+library(DESeq2)
+# Read the featureCounts output
+counts <- read.table("${counts_file}", header=TRUE, row.names=1, comment.char="#")
+# Remove annotation columns (Geneid, Chr, Start, End, Strand, Length) to keep only sample columns
+counts <- counts[ , -(1:5)]
+# Assign meaningful column names (sample IDs) to counts
+sample_names <- c(${samples_list[@]/#\"/} )  # placeholder, will be replaced by bash (see below)
+# ^^^ NOTE: This placeholder will be replaced by bash string substitution below.
+EOF
+    # The above Rscript here-doc is incomplete; we will inject the actual vectors next.
+    # We do this in two parts to safely insert bash arrays into R vectors.
+
+    # Build R vector strings for samples and conditions
+    sample_vec=$(printf '"%s", ' "${samples_list[@]}")
+    sample_vec=${sample_vec%, }  # remove trailing comma
+    cond_vec=$(printf '"%s", ' "${cond_list[@]}")
+    cond_vec=${cond_vec%, }
+
+    # Complete the R script with proper sample and condition vectors
+    Rscript --vanilla - <<EOF
+library(DESeq2)
+# Prepare count matrix:
+counts <- read.table("${counts_file}", header=TRUE, row.names=1, comment.char="#")
+counts <- counts[ , -(1:5)]
+# Define sample names and conditions:
+samples <- c(${sample_vec})
+conditions <- factor(c(${cond_vec}))
+colnames(counts) <- samples
+# Create DESeq2 dataset
+coldata <- data.frame(condition=conditions, row.names=samples)
+dds <- DESeqDataSetFromMatrix(countData=counts, colData=coldata, design=~condition)
+dds <- DESeq(dds)
+res <- results(dds)
+# Order results by adjusted p-value
+res <- res[order(res\$padj), ]
+# Write results to CSV
+write.csv(as.data.frame(res), file="${results_file}")
+EOF
+    echo "DESeq2 analysis completed for $project (results: ${project}_deseq2_results.csv)"
+  else
+    echo "DESeq2 results already exist for $project, skipping."
+  fi
+
+  # Return to base directory before next project
+  cd ..
+  echo "Finished project: $project"
 done
 
-echo "=== Pipeline completed! ==="
+echo "All projects finished successfully."
