@@ -1,0 +1,109 @@
+#!/bin/bash
+set -eo pipefail
+trap "echo 'Error in line $LINENO'; exit 1" ERR
+
+# --------------------------
+# Configuration Section
+# --------------------------
+export HISAT2_INDEX="/path/to/hisat2/index/base"  # Update this path
+export GTF="/path/to/annotations.gtf"             # Update this path
+THREADS=8                                         # Adjust for your iMac Pro cores
+RAW_DATA_DIR="raw_data"                           # Raw data directory
+SAMPLE_PATTERN="*_R1.fastq"                       # Paired-end naming pattern
+
+# --------------------------
+# Directory Setup
+# --------------------------
+mkdir -p fastqc trimmed align counts logs
+
+# --------------------------
+# Tool Validation
+# --------------------------
+check_tool() {
+    if ! command -v "$1" &> /dev/null; then
+        echo >&2 "ERROR: Required tool '$1' not found!"
+        exit 1
+    fi
+}
+
+check_tool fastqc
+check_tool trim_galore
+check_tool hisat2
+check_tool samtools
+check_tool featureCounts
+
+# --------------------------
+# Quality Control - Raw Data
+# --------------------------
+echo "Running initial FastQC..."
+fastqc -t $THREADS -o fastqc/ $RAW_DATA_DIR/*.fastq 2>&1 | tee logs/1_fastqc_raw.log
+
+# --------------------------
+# Main Processing Loop
+# --------------------------
+for r1 in $RAW_DATA_DIR/$SAMPLE_PATTERN; do
+    # Setup filenames
+    r2=${r1/_R1/_R2}
+    base=$(basename "$r1" _R1.fastq)
+    echo "Processing sample: $base"
+    
+    # --------------------------
+    # Read Trimming
+    # --------------------------
+    echo "Trimming $base..."
+    trim_galore --paired --cores $THREADS \
+        --phred33 \
+        --length 36 \
+        --quality 20 \
+        --stringency 5 \
+        --output_dir trimmed/ \
+        --basename $base \
+        $r1 $r2 2>&1 | tee logs/2_trim_${base}.log
+
+    # --------------------------
+    # Alignment & Processing
+    # --------------------------
+    echo "Aligning $base..."
+    hisat2 -x "$HISAT2_INDEX" -p $THREADS \
+        --new-summary \
+        --summary-file logs/3_align_${base}.log \
+        -1 "trimmed/${base}_val_1.fq" \
+        -2 "trimmed/${base}_val_2.fq" \
+    | samtools sort -O BAM -@ $((THREADS/2)) \
+        -o "align/${base}_sorted.bam"
+    
+    # --------------------------
+    # BAM File Indexing
+    # --------------------------
+    echo "Indexing $base..."
+    samtools index "align/${base}_sorted.bam" 2>&1 | tee logs/4_index_${base}.log
+
+    # --------------------------
+    # Cleanup Temporary Files
+    # --------------------------
+    rm -f "trimmed/${base}_val_1.fq" "trimmed/${base}_val_2.fq"
+done
+
+# --------------------------
+# Read Quantification
+# --------------------------
+echo "Running featureCounts..."
+featureCounts -T $THREADS -a "$GTF" \
+    -o counts/count_matrix.txt \
+    -s 2 \  # Strandedness (adjust 0,1,2 based on library prep)
+    align/*_sorted.bam 2>&1 | tee logs/5_featurecounts.log
+
+# --------------------------
+# Final Quality Control
+# --------------------------
+echo "Running MultiQC..."
+multiqc . -o results/ 2>&1 | tee logs/6_multiqc.log
+
+# --------------------------
+# Completion
+# --------------------------
+echo "Pipeline completed successfully!"
+echo "Results available in:"
+echo " - align/: Sorted BAM files"
+echo " - counts/: Count matrix"
+echo " - results/: MultiQC report"
