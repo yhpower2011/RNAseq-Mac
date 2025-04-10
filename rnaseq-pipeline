@@ -167,8 +167,8 @@ count_data <- count_data[, !(colnames(count_data) %in% cols_to_drop)]
 rownames(count_data) <- count_data$Geneid
 count_data$Geneid <- NULL
 
-# Force columns to numeric and validate structure
 count_data <- as.data.frame(sapply(count_data, function(x) as.numeric(as.character(x))))
+count_data <- count_data[!grepl("^__", rownames(count_data)), ]
 count_data <- count_data[rowSums(count_data) > 0, ]
 stopifnot(is.data.frame(count_data))
 stopifnot(all(sapply(count_data, is.numeric)))
