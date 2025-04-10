@@ -164,8 +164,8 @@ count_data <- read.table("counts/gene_counts.txt", header=TRUE, sep="\t", commen
 cols_to_drop <- c("Chr","Start","End","Strand","Length")
 count_data <- count_data[, !(colnames(count_data) %in% cols_to_drop)]
 
-rownames(count_data) <- count_data\$Geneid
-count_data\$Geneid <- NULL
+rownames(count_data) <- count_data$Geneid
+count_data$Geneid <- NULL
 
 count_data <- count_data[ apply(count_data, 1, function(x) all(is.numeric(x))), ]
 count_data <- count_data[rowSums(count_data) > 0, ]
@@ -181,7 +181,7 @@ coldata <- data.frame(row.names=samples, condition=conditions)
 dds <- DESeqDataSetFromMatrix(countData=count_data, colData=coldata, design=~condition)
 dds <- DESeq(dds)
 res <- results(dds, alpha=0.05)
-res <- res[order(res\$padj), ]
+res <- res[order(res$padj), ]
 res_df <- as.data.frame(res)
 
 dir.create("analysis", showWarnings=FALSE)
@@ -196,15 +196,15 @@ png("analysis/MA_plot.png", width=800, height=600)
 plotMA(res, main="DESeq2 MA-Plot", ylim=c(-5,5))
 dev.off()
 
-res_df\$minusLog10P <- -log10(res_df\$pvalue)
-res_df\$signif <- !is.na(res_df\$padj) & res_df\$padj < 0.05
+res_df$minusLog10P <- -log10(res_df$pvalue)
+res_df$signif <- !is.na(res_df$padj) & res_df$padj < 0.05
 png("analysis/Volcano_plot.png", width=800, height=600)
 with(res_df, plot(log2FoldChange, minusLog10P, pch=20,
      col=ifelse(signif, "red", "gray"),
      xlab="Log2 Fold Change", ylab="-Log10 p-value", main="Volcano Plot"))
 dev.off()
 
-sig_genes <- rownames(res_df)[res_df\$signif]
+sig_genes <- rownames(res_df)[res_df$signif]
 ego <- enrichGO(gene=sig_genes, OrgDb=org.Mm.eg.db, keyType="ENSEMBL", ont="BP",
                 pAdjustMethod="BH", pvalueCutoff=0.05, qvalueCutoff=0.05)
 ego_df <- as.data.frame(ego)
