@@ -161,13 +161,13 @@ suppressMessages(library(clusterProfiler))
 suppressMessages(library(org.Mm.eg.db))
 
 count_data <- read.table("counts/gene_counts.txt", header=TRUE, sep="\t", comment.char="#")
-cols_to_drop <- c("Chr","Start","End","Strand","Length")
+cols_to_drop <- c("Chr", "Start", "End", "Strand", "Length")
 count_data <- count_data[, !(colnames(count_data) %in% cols_to_drop)]
 
 rownames(count_data) <- count_data$Geneid
 count_data$Geneid <- NULL
 
-count_data <- count_data[ apply(count_data, 1, function(x) all(is.numeric(x))), ]
+count_data[] <- lapply(count_data, function(x) as.numeric(as.character(x)))
 count_data <- count_data[rowSums(count_data) > 0, ]
 
 colnames(count_data) <- sub("\\.sorted\\.bam$", "", sub("\\.bam$", "", colnames(count_data)))
