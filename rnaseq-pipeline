@@ -171,10 +171,14 @@ count_data <- as.data.frame(sapply(count_data, function(x) as.numeric(as.charact
 count_data <- count_data[!grepl("^__", rownames(count_data)), ]
 count_data <- count_data[rowSums(count_data) > 0, ]
 
+# Write debug output to file
+debug_file <- "analysis/deseq2_debug.txt"
+sink(debug_file)
 cat("DEBUG: class =", class(count_data), "\n")
 cat("DEBUG: mode  =", mode(count_data), "\n")
 cat("DEBUG: str(count_data):\n")
 str(count_data)
+sink()
 
 stopifnot(is.data.frame(count_data))
 stopifnot(all(sapply(count_data, is.numeric)))
